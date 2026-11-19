@@ -1,1 +1,4 @@
 *.parquet
+full.py
+full2.py
+/__pycache__
