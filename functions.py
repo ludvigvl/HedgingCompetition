@@ -431,3 +431,128 @@ def solve_zero_cost_collar(
         "Put MC standard error (USD/bbl)": put_se,
         "Used flat lower-wing extrapolation": used_flat_lower_wing,
     }
+
+def futures_expiry(contract):
+    """ICE Brent futures expire on the last business day of the second month preceding delivery."""
+    code = contract.split()[0]                      # 'COJ21 Comdty' -> 'COJ21'
+    delivery = pd.Timestamp(2000 + int(code[3:5]), MONTH_CODES[code[2]], 1)
+    return delivery - pd.DateOffset(months=1) - pd.offsets.BDay(1)
+
+def build_fixing_schedule(year, month, front_contract):
+    """Business days of the averaging month and number of fixings on the front / next contract."""
+    start = pd.Timestamp(year, month, 1)
+    fixing_dates = pd.bdate_range(start, start + pd.offsets.MonthEnd(0))
+
+    # The front contract fixes up to and including the second-to-last fixing day before its expiry
+    before_expiry = fixing_dates[fixing_dates < futures_expiry(front_contract)]
+    last_front_fixing = before_expiry[-2]
+
+    n1 = int((fixing_dates <= last_front_fixing).sum())
+    return fixing_dates, n1, len(fixing_dates) - n1
+
+def fixing_thetas(fixing_dates, n1, day):
+    """Year fractions from `day` to each fixing, split by leg."""
+    thetas = ((fixing_dates - pd.Timestamp(day)).days / 365.0).to_numpy()
+    return list(thetas[:n1]), list(thetas[n1:])
+
+def get_smile(day_data, contract, max_rel_spread=0.5, min_mid=0.05):
+    """Implied vols from liquid out-of-the-money quotes, interpolated with PCHIP."""
+    quotes = day_data[day_data['underlying_ticker'] == contract]
+    quotes = quotes[quotes[['option_bid', 'option_ask']].notna().all(axis=1) | quotes['settlement_price'].notna()]
+    if quotes.empty:
+        return None
+    F = quotes['underlying_settlement'].iloc[0]
+
+    strikes, vols = [], []
+    for _, ligne in quotes.iterrows():
+        bid, ask, K = ligne['option_bid'], ligne['option_ask'], ligne['strike']
+
+        if pd.notna(bid) and pd.notna(ask):
+            prix = (bid + ask) / 2
+            # Liquidity filter
+            if bid <= 0 or ask <= bid or prix < min_mid or (ask - bid) / prix > max_rel_spread:
+                continue
+        else:
+            # From June 2020 the file only has settlement prices (settlement = mid when both exist)
+            prix = ligne['settlement_price']
+            if prix < min_mid:
+                continue
+
+        # Out-of-the-money only: calls above F, puts below F
+        if ligne['option_type'] == 'Call' and K >= F:
+            prix_call = prix
+        elif ligne['option_type'] == 'Put' and K < F:
+            prix_call = prix + F - K        # put-call parity with r = 0
+        else:
+            continue
+
+        T = ligne['time_to_expiry_days'] / 365
+        vol = vol_implicite(prix_call, F, K, T)
+        if 0.01 < vol < 4.9:                # drop vols stuck on the bisection bounds
+            strikes.append(K)
+            vols.append(vol)
+
+    if len(strikes) < 3:
+        return None
+    order = np.argsort(strikes)
+    strikes, vols = np.array(strikes)[order], np.array(vols)[order]
+    return {'F': F, 'strikes': strikes, 'vols': vols,
+            'pchip': PchipInterpolator(strikes, vols, extrapolate=False)}
+
+def read_vol(smile, K):
+    """Smile volatility at strike K, flat outside the quoted range."""
+    K = min(max(K, smile['strikes'][0]), smile['strikes'][-1])
+    return float(smile['pchip'](K))
+
+def basket_variance(sigma1, sigma2, theta_1, theta_2, f1, f2, w1, w2, n1, n2, rho):
+    """Same formulas as variance_totale, with rho passed explicitly."""
+    var_A1 = sum((2 * (n1 - k) + 1) * (math.exp(sigma1**2 * theta_1[k-1]) - 1) for k in range(1, n1 + 1))
+    var_A1 *= (f1**2 / n1**2)
+
+    var_A2 = sum((2 * (n2 - j) + 1) * (math.exp(sigma2**2 * theta_2[j-1]) - 1) for j in range(1, n2 + 1))
+    var_A2 *= (f2**2 / n2**2)
+
+    cov = sum(math.exp(rho * sigma1 * sigma2 * theta_1[k-1]) - 1 for k in range(1, n1 + 1))
+    cov *= (f1 * f2 / n1)
+
+    return (w1**2 * var_A1) + (w2**2 * var_A2) + (2 * w1 * w2 * cov)
+
+def price_asian(K, option_type, f1, f2, smile1, smile2, rho, theta_1, theta_2, D=1.0):
+    """Moment-matching price of the Asian basket call/put, per barrel."""
+    n1, n2 = len(theta_1), len(theta_2)
+    w1, w2 = n1 / (n1 + n2), n2 / (n1 + n2)
+    F_avg = w1 * f1 + w2 * f2
+
+    sigma1 = read_vol(smile1, f1 * K / F_avg)
+    sigma2 = read_vol(smile2, f2 * K / F_avg)
+
+    var = basket_variance(sigma1, sigma2, theta_1, theta_2, f1, f2, w1, w2, n1, n2, rho)
+    v = math.sqrt(math.log(1 + var / F_avg**2))
+    return D * black_76(F_avg, K, v, 0, 1.0, option_type)
+
+def solve_put_strike(call_price, f1, f2, smile1, smile2, rho, theta_1, theta_2, D=1.0, K_call=78.0):
+    """Bisection on K_put such that Put(K_put) = Call(K_call)."""
+    bas, haut = 1.0, K_call
+    for _ in range(100):
+        K_put = (bas + haut) / 2
+        prix_put = price_asian(K_put, 'put', f1, f2, smile1, smile2, rho, theta_1, theta_2, D)
+        if prix_put > call_price:
+            haut = K_put
+        else:
+            bas = K_put
+        if haut - bas < 1e-8:
+            break
+    return K_put
+
+def discount_factor(day_data, day, payment_date):
+    """SOFR discount factor (the dataset gives one overnight rate per day, in %)."""
+    r = day_data['sofr_rate'].iloc[0] / 100
+    return math.exp(-r * (pd.Timestamp(payment_date) - pd.Timestamp(day)).days / 365)
+
+def estimate_rho_rolling(day, window=60, min_obs=20, default=0.99):
+    """Correlation of daily log-returns over the last `window` days up to `day`."""
+    r = log_returns.loc[:day].dropna().tail(window)
+    if len(r) < min_obs:
+        return default
+    return r[tickers[0]].corr(r[tickers[1]])
+
