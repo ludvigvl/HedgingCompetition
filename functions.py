@@ -9,7 +9,7 @@ from datetime import date
 from scipy.interpolate import PchipInterpolator
 
 
-def build_fixing_schedule(
+def build_fixing_schedule1(
     fixing_dates, valuation_date, front_expiry, front_contract, next_contract
 ):
     """Assign a futures contract and an ACT/365 time to each fixing."""
@@ -217,7 +217,6 @@ def simulate_correlated_futures(
             # One fixing uses Apr21, the other May21
                 Sigma[a, b] = rho * sigma1 * sigma2 * min_theta
 
-    Chol = np.linalg.cholesky(Sigma)
     if normal_draws is None:
         Z = np.random.normal(size=(N, n_simulations))
     else:
@@ -232,8 +231,6 @@ def simulate_correlated_futures(
     # Simulate each branch, then average over its fixing dates.
     fixings_plus = F0[:, None] * np.exp(mu[:, None] + shock)
     fixings_minus = F0[:, None] * np.exp(mu[:, None] - shock)
-
-
 
     # Apr21 arithmetic average on each branch
     A1_plus = fixings_plus[:n1, :].mean(axis=0)
@@ -255,10 +252,6 @@ def simulate_correlated_futures(
     call_pairs = (call_plus + call_minus) / 2
     put_pairs = (put_plus + put_minus) / 2
 
-    
-    print(f"Monte Carlo mean (call): {call_pairs.mean():.6f}, Monte Carlo std (call): {call_pairs.std(ddof=1)/np.sqrt(call_pairs.size):.6f}")
-    print(f"Monte Carlo mean (put): {put_pairs.mean():.6f}, Monte Carlo std (put): {put_pairs.std(ddof=1)/np.sqrt(put_pairs.size):.6f}")
-
     n_pairs = call_pairs.size
     price_call = D * call_pairs.mean()
     price_put = D * put_pairs.mean()
@@ -268,10 +261,12 @@ def simulate_correlated_futures(
     if verbose:
         A_pairs = (A_plus + A_minus) / 2
         avg_se = A_pairs.std(ddof=1) / np.sqrt(n_pairs)
+        print(f"Monte Carlo mean (call): {price_call:.6f}, SE: {std_call:.6f}")
+        print(f"Monte Carlo mean (put): {price_put:.6f}, SE: {std_put:.6f}")
         print(f"Monte Carlo mean of A: {A_pairs.mean():.6f}, SE: {avg_se:.6f}")
     return price_call, price_put, std_call, std_put
 
-def price_asian(
+def price_asian1(
     K, *,
     F1, F2, Favg,
     smile_apr21, smile_may21,
@@ -375,10 +370,10 @@ def solve_zero_cost_collar(
         D=D,
     )
 
-    call_price, _, call_se, _ = price_asian(K_call, **pricing_inputs)
+    call_price, _, call_se, _ = price_asian1(K_call, **pricing_inputs)
 
     def premium_difference(K):
-        _, put_price, _, _ = price_asian(K, **pricing_inputs)
+        _, put_price, _, _ = price_asian1(K, **pricing_inputs)
         return put_price - call_price
 
     bracket, gaps = find_strike_bracket(premium_difference, K_low, K_high)
@@ -401,7 +396,7 @@ def solve_zero_cost_collar(
         }
 
         def lower_wing_difference(K):
-            _, put_price, _, _ = price_asian(K, **put_inputs)
+            _, put_price, _, _ = price_asian1(K, **put_inputs)
             return put_price - call_price
 
         objective = lower_wing_difference
@@ -420,7 +415,7 @@ def solve_zero_cost_collar(
     else:
         K_put = brentq(objective, K_left, K_right, xtol=1e-6)
 
-    _, put_price, _, put_se = price_asian(K_put, **put_inputs)
+    _, put_price, _, put_se = price_asian1(K_put, **put_inputs)
     return {
         "Call strike (USD/bbl)": K_call,
         "Zero-cost put strike (USD/bbl)": K_put,
@@ -431,6 +426,9 @@ def solve_zero_cost_collar(
         "Put MC standard error (USD/bbl)": put_se,
         "Used flat lower-wing extrapolation": used_flat_lower_wing,
     }
+
+MONTH_CODES = {'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6,
+               'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12}
 
 def futures_expiry(contract):
     """ICE Brent futures expire on the last business day of the second month preceding delivery."""
@@ -549,10 +547,9 @@ def discount_factor(day_data, day, payment_date):
     r = day_data['sofr_rate'].iloc[0] / 100
     return math.exp(-r * (pd.Timestamp(payment_date) - pd.Timestamp(day)).days / 365)
 
-def estimate_rho_rolling(day, window=60, min_obs=20, default=0.99):
+def estimate_rho_rolling(log_returns, tickers, day, window=60, min_obs=20, default=0.99):
     """Correlation of daily log-returns over the last `window` days up to `day`."""
     r = log_returns.loc[:day].dropna().tail(window)
     if len(r) < min_obs:
         return default
     return r[tickers[0]].corr(r[tickers[1]])
-
