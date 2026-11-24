@@ -553,3 +553,135 @@ def estimate_rho_rolling(log_returns, tickers, day, window=60, min_obs=20, defau
     if len(r) < min_obs:
         return default
     return r[tickers[0]].corr(r[tickers[1]])
+
+
+def collar_value(f1, f2, smile1, smile2, rho, theta_1, theta_2, D, K_put, K_call=78.0, notional=1_000_000):
+    """Market maker's position in $: long Put(K_put), short Call(K_call)."""
+    put = price_asian(K_put, 'put', f1, f2, smile1, smile2, rho, theta_1, theta_2, D)
+    call = price_asian(K_call, 'call', f1, f2, smile1, smile2, rho, theta_1, theta_2, D)
+    return notional * (put - call)
+
+def collar_greeks(f1, f2, smile1, smile2, rho, theta_1, theta_2, D, K_put, bump=0.01):
+    """Value, delta (bbl) and gamma (bbl per $) for a parallel move of both futures, by bump and reprice."""
+    h = bump * f1
+    args = (smile1, smile2, rho, theta_1, theta_2, D, K_put)
+    V = collar_value(f1, f2, *args)
+    V_up = collar_value(f1 + h, f2 + h, *args)
+    V_down = collar_value(f1 - h, f2 - h, *args)
+    delta = (V_up - V_down) / (2 * h)
+    gamma = (V_up - 2 * V + V_down) / h**2
+    return V, delta, gamma
+
+def black_76_greeks(F, K, sigma, T, option_type='call'):
+    """Closed-form Black-76 delta, gamma and vega per barrel (r = 0)."""
+    d1 = (np.log(F / K) + 0.5 * sigma**2 * T) / (sigma * np.sqrt(T))
+    delta = norm.cdf(d1) if option_type == 'call' else norm.cdf(d1) - 1
+    gamma = norm.pdf(d1) / (F * sigma * np.sqrt(T))
+    vega = F * norm.pdf(d1) * np.sqrt(T)
+    return delta, gamma, vega
+
+
+def option_quote(day_data, contract, option_type, strike):
+    """Price (mid, or settlement when there is no bid/ask), half bid-ask spread and time to expiry of a listed option."""
+    q = day_data[(day_data['underlying_ticker'] == contract)
+                 & (day_data['option_type'] == option_type)
+                 & (day_data['strike'] == strike)]
+    if q.empty:
+        return None
+    ligne = q.iloc[0]
+    T = ligne['time_to_expiry_days'] / 365
+    if pd.notna(ligne['option_bid']) and pd.notna(ligne['option_ask']):
+        return (ligne['option_bid'] + ligne['option_ask']) / 2, (ligne['option_ask'] - ligne['option_bid']) / 2, T
+    return ligne['settlement_price'], np.nan, T
+
+
+def backtest_delta_gamma(greeks, df, smiles_by_day, futures_prices, contract, hedge_option,
+                         use_gamma=True, half_spread_opt=0.12, half_spread_fut=0.03, band=0.0,
+                         K_put=None, K_call=78.0):
+    """Daily delta (and gamma) hedge of the collar with one futures contract and one listed option.
+    hedge_option: ('Put', 45.0) for a fixed option, or 'auto' for the listed call closest to K_call when
+    the collar is short gamma and the listed put closest to K_put when it is long gamma (round strikes,
+    kept as long as the sign of the gamma does not change).
+    half_spread_* are used on days without bid/ask quotes. Options are only traded when the position
+    is more than `band` (in % of the target) away from the gamma-neutral quantity, or when the hedging
+    option changes; futures are rebalanced daily."""
+    days = greeks.index
+    data_by_day = dict(tuple(df[df['date'].isin(days)].groupby('date')))
+
+    held, n_opt, q_fut, cash = None, 0.0, 0.0, 0.0
+    rows = []
+    for i, day in enumerate(days):
+        day_data = data_by_day[day]
+        quotes = day_data[day_data['underlying_ticker'] == contract]
+        smile = smiles_by_day[day][contract]
+        F = futures_prices.at[day, contract]
+        T = quotes['time_to_expiry_days'].iloc[0] / 365
+        half_fut = (quotes['underlying_ask'].iloc[0] - quotes['underlying_bid'].iloc[0]) / 2
+        if np.isnan(half_fut):
+            half_fut = half_spread_fut
+
+        def quote(option):
+            """Price and half spread of an option; model price if the strike is not listed today."""
+            q = option_quote(day_data, contract, *option)
+            if q is None:
+                return float(black_76(F, option[1], read_vol(smile, option[1]), 0, T, option[0].lower())), half_spread_opt
+            prix, half, _ = q
+            return prix, (half_spread_opt if np.isnan(half) else half)
+
+        # 1. P&L of the positions held since yesterday (futures and options are settled daily in cash)
+        pnl_collar = pnl_opt = pnl_fut = interest = 0.0
+        if i > 0:
+            pnl_collar = greeks.at[day, 'value'] - greeks.at[prev_day, 'value']
+            if held is not None:
+                pnl_opt = n_opt * (quote(held)[0] - prev_opt)
+            pnl_fut = q_fut * (F - prev_F)
+            interest = cash * prev_r * (day - prev_day).days / 365
+
+        # 2. Hedging option of the day
+        gamma_c = greeks.at[day, 'gamma']
+        if hedge_option == 'auto':
+            option_type, K_target = ('Call', K_call) if gamma_c < 0 else ('Put', K_put)
+            # Round strikes only: they stay listed over the whole sample
+            listed = quotes[(quotes['option_type'] == option_type) & (quotes['strike'] % 5 == 0)].dropna(subset=['settlement_price'])
+            if held is not None and held[0] == option_type and held[1] in listed['strike'].values:
+                target = held                      # same gamma sign: keep the option already held
+            else:
+                target = (option_type, float(listed['strike'].iloc[(listed['strike'] - K_target).abs().argmin()]))
+        else:
+            target = hedge_option
+        delta_o, gamma_o, _ = black_76_greeks(F, target[1], read_vol(smile, target[1]), T, target[0].lower())
+        n_target = -gamma_c / gamma_o if use_gamma else 0.0
+
+        # 3. Option trades: a new option means closing the old position and opening the new one
+        cost = 0.0
+        if target != held:
+            if held is not None:
+                cost += abs(n_opt) * quote(held)[1]
+            new_n = n_target
+            cost += abs(new_n) * quote(target)[1]
+            rebalance = True
+        else:
+            rebalance = abs(n_target - n_opt) > band * abs(n_target)
+            new_n = n_target if rebalance else n_opt
+            cost += abs(new_n - n_opt) * quote(target)[1]
+
+        # 4. Futures cancel the remaining delta
+        new_q = -(greeks.at[day, 'delta'] + new_n * delta_o)
+        cost += abs(new_q - q_fut) * half_fut
+
+        cash += pnl_opt + pnl_fut + interest - cost
+        rows.append({'date': day, 'collar': greeks.at[day, 'value'], 'cash': cash,
+                     'portfolio': greeks.at[day, 'value'] + cash,
+                     'pnl': pnl_collar + pnl_opt + pnl_fut + interest - cost,
+                     'pnl_collar': pnl_collar, 'pnl_options': pnl_opt, 'pnl_futures': pnl_fut,
+                     'interest': interest, 'cost': cost,
+                     'option': f"{target[0]} {target[1]:g}", 'n_options': new_n, 'q_futures': new_q,
+                     'options_traded': rebalance and new_n != 0,
+                     'residual_gamma': gamma_c + new_n * gamma_o})
+
+        held, n_opt, q_fut = target, new_n, new_q
+        prev_day, prev_opt, prev_F = day, quote(held)[0], F
+        prev_r = day_data['sofr_rate'].iloc[0] / 100
+
+    return pd.DataFrame(rows).set_index('date')
+
