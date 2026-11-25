@@ -685,3 +685,173 @@ def backtest_delta_gamma(greeks, df, smiles_by_day, futures_prices, contract, he
 
     return pd.DataFrame(rows).set_index('date')
 
+
+def asian_mc(
+    K, option_type, futures, smiles, rho, theta, legs,
+    fixed_sum, n_fixings, normal_draws, D=1.0,
+):
+    """Returnera pris och två sticky-vol-deltan, per fat."""
+    if option_type not in ("call", "put"):
+        raise ValueError("option_type must be 'call' or 'put'.")
+
+    sign = 1.0 if option_type == "call" else -1.0
+    theta = np.asarray(theta, dtype=float)
+    legs = np.asarray(legs, dtype=int)
+    futures = np.asarray(futures, dtype=float)
+
+    if theta.size == 0:
+        payoff = max(sign * (fixed_sum / n_fixings - K), 0.0)
+        return D * payoff, np.zeros(2)
+
+    active_legs = np.unique(legs)
+    Favg = (fixed_sum + futures[legs].sum()) / n_fixings
+
+    sigma_by_leg = np.zeros(2)
+    for leg in active_legs:
+        mapped_strike = K * futures[leg] / Favg
+        sigma_by_leg[leg] = read_vol(smiles[leg], mapped_strike)
+
+    sigma = sigma_by_leg[legs]
+    mu = -0.5 * sigma**2 * theta
+    correlation = np.where(legs[:, None] == legs[None, :], 1.0, rho)
+    Sigma = (
+        np.outer(sigma, sigma)
+        * correlation
+        * np.minimum.outer(theta, theta)
+    )
+    shock = np.linalg.cholesky(Sigma) @ normal_draws[:theta.size]
+
+    price = 0.0
+    deltas = np.zeros(2)
+
+    for direction in (1, -1):
+        multipliers = np.exp(mu[:, None] + direction * shock)
+        simulated_fixings = futures[legs, None] * multipliers
+
+        # A = w1*A1 + w2*A2 using the original fixing counts.
+        # fixed_sum contains the observed fixings from both legs.
+        A = (fixed_sum + simulated_fixings.sum(axis=0)) / n_fixings
+        intrinsic = sign * (A - K)
+        price += np.maximum(intrinsic, 0.0).mean()
+
+        for leg in active_legs:
+            dA_dF = multipliers[legs == leg].sum(axis=0) / n_fixings
+            deltas[leg] += (sign * (intrinsic > 0) * dA_dF).mean()
+
+    return D * price / 2, D * deltas / 2
+
+def minimum_variance_position(
+    futures_changes, collar_changes, delta_target,
+    active, window=60, min_obs=20,
+):
+    """Returnera hedgepositioner i fat, antal observationer och metod."""
+    active = np.asarray(active, dtype=bool)
+    positions = np.zeros(2)
+
+    if not active.any():
+        return positions, 0, "settled"
+
+    X = np.asarray(futures_changes, dtype=float).reshape(-1, 2)[:, active]
+    y = np.asarray(collar_changes, dtype=float)
+
+    valid = np.isfinite(X).all(axis=1) & np.isfinite(y)
+    X, y = X[valid][-window:], y[valid][-window:]
+
+    if len(y) >= min_obs:
+        X_centered = X - X.mean(axis=0)
+        beta, _, rank, _ = np.linalg.lstsq(
+            X_centered, y - y.mean(), rcond=1e-8
+        )
+        if rank == X_centered.shape[1]:
+            positions[active] = -beta
+            return positions, len(y), "minimum_variance"
+
+    positions[active] = np.asarray(delta_target)[active]
+    return positions, len(y), "delta_fallback"
+
+def build_hedge_option_marks(df, option_specs):
+    """Bygg dagliga marks och spreads för de valda noterade optionerna."""
+    marks = {}
+
+    for ticker, option_type, strike, fallback_half_spread in option_specs:
+        rows = df.loc[
+            df["underlying_ticker"].eq(ticker)
+            & df["option_type"].str.lower().eq(option_type.lower())
+            & df["strike"].eq(strike)
+        ].copy()
+
+        expiries = pd.to_datetime(rows["expiration"]).dropna().dt.normalize().unique()
+        if len(expiries) != 1:
+            raise ValueError(
+                f"Förväntade en optionslöptid för {ticker} {option_type} {strike}, "
+                f"hittade {len(expiries)}."
+            )
+
+        expiry = pd.Timestamp(expiries[0])
+        bid = rows["option_bid"]
+        ask = rows["option_ask"]
+        valid_quote = np.isfinite(bid) & np.isfinite(ask) & bid.ge(0) & ask.ge(bid)
+        settlement = rows["settlement_price"]
+        valid_settlement = np.isfinite(settlement) & settlement.ge(0)
+
+        rows["mark"] = settlement.where(valid_settlement).fillna(
+            ((bid + ask) / 2).where(valid_quote)
+        )
+        rows["half_spread"] = ((ask - bid) / 2).where(
+            valid_quote, fallback_half_spread
+        )
+        rows["date"] = pd.to_datetime(rows["date"]).dt.normalize()
+
+        name = f"{ticker} {option_type} {strike:g}"
+        daily_marks = (
+            rows.dropna(subset=["mark"])
+            .drop_duplicates("date")
+            .set_index("date")[["mark", "half_spread"]]
+            .sort_index()
+        )
+
+        # Stäng senast handelsdagen före optionens förfall.
+        close_by = expiry - pd.offsets.BDay(1)
+        marks[name] = (daily_marks, close_by)
+
+    return marks
+
+
+def residual_minvar_position(
+    instrument_changes, delta_residuals, baseline, eligible,
+    window=60, min_obs=20, ridge=0.1,
+):
+    """Lägg en regulariserad minsta-varianskorrigering ovanpå delta."""
+    baseline = np.asarray(baseline, dtype=float)
+    eligible = np.asarray(eligible, dtype=bool)
+    target = baseline.copy()
+
+    if not eligible.any():
+        return target, 0, "delta_only"
+
+    X = np.asarray(instrument_changes, dtype=float).reshape(-1, baseline.size)
+    X = X[:, eligible]
+    y = np.asarray(delta_residuals, dtype=float)
+
+    # Begränsa först kalenderfönstret. Använd sedan kompletta observationer.
+    X, y = X[-window:], y[-window:]
+    valid = np.isfinite(X).all(axis=1) & np.isfinite(y)
+    X, y = X[valid], y[valid]
+
+    if len(y) < min_obs:
+        return target, len(y), "delta_fallback"
+
+    X = X - X.mean(axis=0)
+    y = y - y.mean()
+    covariance = X.T @ X / len(y)
+    cross_covariance = X.T @ y / len(y)
+    scale = np.trace(covariance) / covariance.shape[0]
+
+    if scale <= 0:
+        return target, len(y), "delta_fallback"
+
+    penalty = ridge * scale * np.eye(covariance.shape[0])
+    correction = np.linalg.solve(covariance + penalty, cross_covariance)
+    target[eligible] -= correction
+
+    return target, len(y), "residual_minvar"
