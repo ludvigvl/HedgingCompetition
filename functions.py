@@ -855,3 +855,175 @@ def residual_minvar_position(
     target[eligible] -= correction
 
     return target, len(y), "residual_minvar"
+
+# ---------------------------------------------------------------------------
+# Vega of the collar
+# ---------------------------------------------------------------------------
+def shift_smile(smile, dvol):
+    """Parallel shift of a smile dict (same strikes, vols + dvol)."""
+    vols = np.maximum(np.asarray(smile['vols'], float) + dvol, 1e-4)
+    out = dict(smile)
+    out['vols'] = vols
+    out['pchip'] = PchipInterpolator(smile['strikes'], vols, extrapolate=False)
+    return out
+
+
+def collar_vega(f1, f2, smile1, smile2, rho, theta_1, theta_2, D, K_put, dvol=0.01):
+    """Collar vega in $ per unit of volatility (divide by 100 for one volatility point).
+
+    Parallel shift of both smiles by +/- dvol, bump and reprice with the collar pricer.
+    """
+    args = (rho, theta_1, theta_2, D, K_put)
+    up = collar_value(f1, f2, shift_smile(smile1, dvol), shift_smile(smile2, dvol), *args)
+    dn = collar_value(f1, f2, shift_smile(smile1, -dvol), shift_smile(smile2, -dvol), *args)
+    return (up - dn) / (2 * dvol)
+
+
+def add_vega(greeks, calibration, smiles_by_day, tickers, fixing_dates, n1, K_put, dvol=0.01):
+    """Return a copy of the daily `greeks` table with a 'vega' column and 'vega_pnl'.
+
+    vega_pnl = vega * (next-day change of the Apr21 ATM volatility): the P&L left by a hedge that
+    is not vega-hedged (the analogue of 1/2 Gamma dF^2 for gamma).
+    """
+    out = greeks.copy()
+    vega = []
+    for day in out.index:
+        sm = smiles_by_day[day]
+        th1, th2 = fixing_thetas(fixing_dates, n1, day)
+        vega.append(collar_vega(calibration.at[day, 'f1'], calibration.at[day, 'f2'],
+                                sm[tickers[0]], sm[tickers[1]], calibration.at[day, 'rho'],
+                                th1, th2, calibration.at[day, 'D'], K_put, dvol))
+    out['vega'] = vega
+    dsig = calibration['atm_vol_1'].shift(-1).reindex(out.index) - calibration['atm_vol_1'].reindex(out.index)
+    out['vega_pnl'] = out['vega'] * dsig
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Backtest: delta hedge with futures + vega (or gamma and vega) hedge with listed options
+# ---------------------------------------------------------------------------
+def backtest_delta_vega(greeks, df, smiles_by_day, futures_prices, contract, hedge_options,
+                        neutralize=('vega',), half_spread_opt=0.12, half_spread_fut=0.03,
+                        band=0.0, roll_band=0.10, max_option_position=3e6):
+    """Daily hedge of the collar: futures for the delta, listed options for the vega (and the gamma).
+
+    hedge_options : list of options, each ('Put', 45.0) / ('Call', 80.0) (fixed) or 'atm' (a call on the
+                    contract whose strike is the round strike, multiple of 5, closest to the futures price,
+                    kept while |ln(K/F)| <= roll_band); the string 'atm' alone means [ 'atm' ].
+    neutralize    : greeks set to zero with the options, one option per greek:
+                    ('vega',) with one option, ('gamma', 'vega') with two options (2x2 linear system),
+                    () for a delta-only hedge.
+    band          : an option position is changed only if it differs from its target by more than
+                    band * |target| (in %), or if the option itself changes.
+    max_option_position : cap on each option position (barrels). An option whose greeks are close to zero
+                    (e.g. a far out-of-the-money call after a crash) would otherwise get an explosive
+                    vega-neutral quantity; when the cap binds the residual greek is not zero (see
+                    'residual_vega', 'residual_gamma').
+    The option greeks use the smile volatility at the option strike (Black-76), as in functions.py.
+    """
+    slots = ['atm'] if hedge_options == 'atm' else list(hedge_options)
+    if len(slots) != len(neutralize):
+        raise ValueError("One hedging option per neutralised greek.")
+    days = greeks.index
+    data_by_day = dict(tuple(df[df['date'].isin(days)].groupby('date')))
+    n_opt_slots = len(slots)
+
+    held = [None] * n_opt_slots              # options held (type, strike)
+    n_opt = np.zeros(n_opt_slots)            # positions in barrels
+    prev_opt_price = [np.nan] * n_opt_slots
+    q_fut, rows = 0.0, []
+    for i, day in enumerate(days):
+        day_data = data_by_day[day]
+        quotes = day_data[day_data['underlying_ticker'] == contract]
+        smile = smiles_by_day[day][contract]
+        F = futures_prices.at[day, contract]
+        T = quotes['time_to_expiry_days'].iloc[0] / 365
+        half_fut = (quotes['underlying_ask'].iloc[0] - quotes['underlying_bid'].iloc[0]) / 2
+        if np.isnan(half_fut):
+            half_fut = half_spread_fut
+
+        def quote(option):
+            """Price and half spread of an option; model price if the strike is not listed today."""
+            q = option_quote(day_data, contract, *option)
+            if q is None:
+                return float(black_76(F, option[1], read_vol(smile, option[1]), 0, T, option[0].lower())), half_spread_opt
+            prix, half, _ = q
+            return prix, (half_spread_opt if np.isnan(half) else half)
+
+        # 1. P&L of the positions held since yesterday
+        pnl_collar = pnl_opt = pnl_fut = interest = 0.0
+        if i > 0:
+            pnl_collar = greeks.at[day, 'value'] - greeks.at[prev_day, 'value']
+            for j, opt in enumerate(held):
+                if opt is not None and n_opt[j] != 0.0:
+                    pnl_opt += n_opt[j] * (quote(opt)[0] - prev_opt_price[j])
+            pnl_fut = q_fut * (F - prev_F)
+            interest = cash * prev_r * (day - prev_day).days / 365 if i > 0 else 0.0
+
+        # 2. Hedging options of the day
+        listed = quotes[(quotes['option_type'] == 'Call') & (quotes['strike'] % 5 == 0)].dropna(subset=['settlement_price'])
+        targets = []
+        fixed_strikes = {spec[1] for spec in slots if spec != 'atm'}
+        # a call and a put with the same strike have the same gamma and vega: avoid a singular system
+        candidates = listed[~listed['strike'].isin(fixed_strikes)]
+        for j, spec in enumerate(slots):
+            if spec != 'atm':
+                targets.append(spec)
+                continue
+            cur = held[j]
+            if cur is not None and cur[1] in candidates['strike'].values and abs(np.log(cur[1] / F)) <= roll_band:
+                targets.append(cur)
+            else:
+                targets.append(('Call', float(candidates['strike'].iloc[(candidates['strike'] - F).abs().argmin()])))
+        if targets:
+            g = np.array([black_76_greeks(F, o[1], read_vol(smile, o[1]), T, o[0].lower()) for o in targets])
+            delta_o, gamma_o, vega_o = g[:, 0], g[:, 1], g[:, 2]
+        else:                                    # delta-only hedge: no option
+            delta_o = gamma_o = vega_o = np.zeros(0)
+        collar_g = {'gamma': greeks.at[day, 'gamma'], 'vega': greeks.at[day, 'vega']}
+        if len(neutralize) == 0:
+            n_target = np.zeros(n_opt_slots)
+        else:
+            col = {'gamma': gamma_o, 'vega': vega_o}
+            A = np.array([col[name] for name in neutralize])
+            b = -np.array([collar_g[name] for name in neutralize])
+            n_target = np.linalg.lstsq(A, b, rcond=1e-10)[0] if len(neutralize) > 1 else b / A[0]
+            n_target = np.clip(n_target, -max_option_position, max_option_position)
+
+        # 3. Option trades: a new option means closing the old position and opening the new one
+        cost, new_n, traded = 0.0, n_opt.copy(), False
+        for j, target in enumerate(targets):
+            if target != held[j]:
+                if held[j] is not None:
+                    cost += abs(n_opt[j]) * quote(held[j])[1]
+                new_n[j] = n_target[j]
+                cost += abs(new_n[j]) * quote(target)[1]
+                traded = traded or new_n[j] != 0
+            else:
+                if abs(n_target[j] - n_opt[j]) > band * abs(n_target[j]):
+                    new_n[j] = n_target[j]
+                    traded = traded or new_n[j] != n_opt[j]
+                cost += abs(new_n[j] - n_opt[j]) * quote(target)[1]
+
+        # 4. Futures cancel the remaining delta
+        new_q = -(greeks.at[day, 'delta'] + float(np.dot(new_n, delta_o)))
+        cost += abs(new_q - q_fut) * half_fut
+
+        cash = (cash if i > 0 else 0.0) + pnl_opt + pnl_fut + interest - cost
+        rows.append({'date': day, 'collar': greeks.at[day, 'value'], 'cash': cash,
+                     'portfolio': greeks.at[day, 'value'] + cash,
+                     'pnl': pnl_collar + pnl_opt + pnl_fut + interest - cost,
+                     'pnl_collar': pnl_collar, 'pnl_options': pnl_opt, 'pnl_futures': pnl_fut,
+                     'interest': interest, 'cost': cost,
+                     'option': ' + '.join(f"{t[0]} {t[1]:g}" for t in targets),
+                     'n_options': new_n[0] if n_opt_slots else 0.0, 'n_options_2': new_n[1] if n_opt_slots > 1 else 0.0,
+                     'q_futures': new_q, 'options_traded': traded,
+                     'residual_vega': collar_g['vega'] + float(np.dot(new_n, vega_o)),
+                     'residual_gamma': collar_g['gamma'] + float(np.dot(new_n, gamma_o))})
+
+        held, n_opt, q_fut = list(targets), new_n, new_q
+        prev_day, prev_F = day, F
+        prev_opt_price = [quote(o)[0] for o in held]
+        prev_r = day_data['sofr_rate'].iloc[0] / 100
+
+    return pd.DataFrame(rows).set_index('date')
